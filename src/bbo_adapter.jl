@@ -13,24 +13,25 @@ The function wraps the underlying function f.f into an OptimizationFunction.
 # Returns
 - An OptimizationFunction that can be used with Optimization.jl
 """
-function to_optimization_function(f::BBOBFunction; autodiff=nothing)
+function to_optimization_function(f::BBOBFunction; autodiff=:none)
     # Create a wrapper function that conforms to the (x, p) signature expected by OptimizationFunction
     wrapper_fn = (x, p) -> f.f(x)
     
     # Create the OptimizationFunction with appropriate autodiff setting
-    if autodiff === nothing
-        return OptimizationFunction(wrapper_fn, Optimization.AutoForwardDiff())
-    elseif autodiff === :none
-        # Use the OptimizationFunction constructor without an AD type
+    if autodiff === :none
+        # Default: Use the OptimizationFunction constructor without an AD type for black-box problems
         return OptimizationFunction(wrapper_fn)
     else
+        # Allow users to specify other AD backends if needed
+        # Note: If `autodiff=nothing` is passed, Optimization.jl might default to AutoForwardDiff
+        # but our function default is :none
         return OptimizationFunction(wrapper_fn, autodiff)
     end
 end
 
 """
     to_optimization_problem(f::BBOBFunction, dimension::Int; 
-                          x0=nothing, lb=-5.5, ub=5.5, autodiff=nothing)
+                          x0=nothing, lb=-5.5, ub=5.5, autodiff=:none)
 
 Create an OptimizationProblem from a BBOBFunction.
 
@@ -40,13 +41,13 @@ Create an OptimizationProblem from a BBOBFunction.
 - `x0=nothing`: Initial point (if nothing, will generate a random point)
 - `lb=-5.5`: Lower bound for all variables
 - `ub=5.5`: Upper bound for all variables
-- `autodiff=nothing`: The autodiff backend to use (if nothing, defaults to AutoForwardDiff)
+- `autodiff=:none`: The autodiff backend to use (default: :none)
 
 # Returns
 - An OptimizationProblem ready to be solved
 """
 function to_optimization_problem(f::BBOBFunction, dimension::Int; 
-                               x0=nothing, lb=-5.5, ub=5.5, autodiff=nothing)
+                               x0=nothing, lb=-5.5, ub=5.5, autodiff=:none)
     # Convert BBOBFunction to OptimizationFunction
     opt_f = to_optimization_function(f; autodiff=autodiff)
     
@@ -63,7 +64,7 @@ end
 
 """
     run_bbob_benchmark(f::BBOBFunction, optimizer, dimension::Int; 
-                     max_iters=1000, n_trials=10, verbose=false, autodiff=nothing)
+                     max_iters=1000, n_trials=10, verbose=false, autodiff=:none)
 
 Run a basic benchmark on a BBOBFunction using the provided optimizer.
 
@@ -74,13 +75,13 @@ Run a basic benchmark on a BBOBFunction using the provided optimizer.
 - `max_iters=1000`: Maximum number of iterations
 - `n_trials=10`: Number of trials to run
 - `verbose=false`: Whether to print progress information
-- `autodiff=nothing`: The autodiff backend to use (if nothing, defaults to AutoForwardDiff)
+- `autodiff=:none`: The autodiff backend to use (default: :none)
 
 # Returns
 - A NamedTuple containing benchmark results
 """
 function run_bbob_benchmark(f::BBOBFunction, optimizer, dimension::Int; 
-                         max_iters=1000, n_trials=10, verbose=false, autodiff=nothing)
+                         max_iters=1000, n_trials=10, verbose=false, autodiff=:none)
     success_count = 0
     objectives = Float64[]
     distances = Float64[]
@@ -93,14 +94,38 @@ function run_bbob_benchmark(f::BBOBFunction, optimizer, dimension::Int;
         # Create a new problem for each trial (with different random starting point)
         prob = to_optimization_problem(f, dimension; autodiff=autodiff)
         
-        # Use BenchmarkTools to measure execution time more accurately
-        time_trial = @belapsed solve($prob, $optimizer; maxiters=$max_iters) samples=1 evals=1
+        # Use @btimed to get both the result and the time for a single solve execution
+        # BenchmarkTools.jl handles warmup runs before this measurement.
+        local timed_result
+        try
+            # Need local block for @btimed result assignment
+            timed_result = @btimed solve($prob, $optimizer; maxiters=$max_iters)
+        catch e
+            println("Warning: Trial $i failed for optimizer on function $(f.name) in dimension $dimension. Error: $e")
+            # Decide how to handle failure: skip trial? record NaN?
+            # For now, let's skip and continue to next trial
+            continue 
+        end
+
+        # Extract result and time
+        result = timed_result.value
+        time_trial = timed_result.time
         
-        # Solve the problem (outside of timing)
-        result = solve(prob, optimizer; maxiters=max_iters)
+        # Check for valid result (e.g., some solvers might return nothing or error objects on failure)
+        if isnothing(result) || !hasproperty(result, :u) || !hasproperty(result, :objective)
+             println("Warning: Trial $i yielded invalid result for optimizer on function $(f.name) in dimension $dimension.")
+             continue
+        end
         
         # Calculate distance to true minimizer
+        # Ensure f.x_opt is accessible and has sufficient dimensions
+        local dist_to_min
+        if length(f.x_opt) >= dimension
         dist_to_min = norm(result.u - f.x_opt[1:dimension])
+        else
+            println("Warning: Not enough optimal points defined for function $(f.name) in dimension $dimension.")
+            dist_to_min = NaN # Or handle as appropriate
+        end
         
         # Check if solution is successful
         is_success = result.objective < Δf + f.f_opt
@@ -114,20 +139,40 @@ function run_bbob_benchmark(f::BBOBFunction, optimizer, dimension::Int;
         push!(times, time_trial)
         
         if verbose && (i == 1 || i == n_trials || i % 10 == 0)
-            println("Trial $i/$n_trials: objective = $(result.objective), success = $is_success")
+            # Ensure result is valid before printing
+             if !isnothing(result) && hasproperty(result, :objective)
+                println("Trial $i/$n_trials: objective = $(result.objective), success = $is_success, time = $time_trial")
+            else
+                 println("Trial $i/$n_trials: Failed or invalid result.")
+             end
         end
     end
     
     # Calculate statistics without using Statistics directly
-    sum_obj = sum(objectives)
-    sum_dist = sum(distances)
-    sum_time = sum(times)
+    # Check if any trials were successful before calculating stats
     n = length(objectives)
+    if n == 0
+        println("Warning: No successful trials completed for function $(f.name) in dimension $dimension.")
+        # Return default/NaN values or handle as appropriate
+        return (
+            success_rate = 0.0,
+            mean_objective = NaN,
+            mean_distance = NaN,
+            mean_time = NaN,
+            objectives = Float64[],
+            distances = Float64[],
+            times = Float64[]
+        )
+    end
+
+    sum_obj = sum(objectives)
+    sum_dist = sum(filter(!isnan, distances)) # Handle potential NaNs if x_opt was missing
+    sum_time = sum(times)
     
     return (
-        success_rate = success_count / n_trials,
+        success_rate = success_count / n_trials, # Rate over total trials attempted
         mean_objective = sum_obj / n,
-        mean_distance = sum_dist / n,
+        mean_distance = sum_dist / count(!isnan, distances), # Mean over valid distances
         mean_time = sum_time / n,
         objectives = objectives,
         distances = distances,
@@ -149,7 +194,7 @@ Compare multiple optimizers on a single BBOBFunction.
   - `max_iters`: Maximum number of iterations
   - `n_trials`: Number of trials
   - `verbose`: Whether to print progress
-  - `autodiff`: Autodiff backend (e.g., :none to disable)
+  - `autodiff`: Autodiff backend (default: :none)
 
 # Returns
 - A Dictionary mapping optimizer names to benchmark results
